@@ -5,15 +5,17 @@ import pandas as pd
 from flask import Flask, render_template, request, send_file
 import logging
 
-# Suppress unnecessary logging
+# Suppress pdfminer logs
 logging.getLogger('pdfminer').setLevel(logging.WARNING)
 
+# ========== CONFIG ==========
 app = Flask(__name__)
 UPLOAD_FOLDER = "uploads"
 OUTPUT_FOLDER = "converted"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
+# ========== HELPERS ==========
 def clean_numeric_value(value):
     if isinstance(value, str):
         return float(re.sub(r"[^\d.]", "", value.replace(",", "")))
@@ -65,6 +67,7 @@ def extract_numeric_value(text, keyword):
             return 0.0
     return 0.0
 
+# ========== PDF EXTRACTION ==========
 def extract_invoice_line_items(pdf_path):
     text = extract_text(pdf_path)
     base_data = {
@@ -102,6 +105,7 @@ def extract_invoice_summary(pdf_path):
     }
     return pd.DataFrame([summary])
 
+# ========== ROUTES ==========
 @app.route("/", methods=["GET", "POST"])
 def index():
     if request.method == "POST":
@@ -153,6 +157,7 @@ def index():
 
     return render_template("index.html")
 
+# ========== ENTRY POINT ==========
 if __name__ == "__main__":
-    # ✅ This line ensures it reads the port from Railway or defaults to 5000 locally
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
