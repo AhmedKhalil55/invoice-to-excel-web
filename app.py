@@ -10,6 +10,7 @@ logging.getLogger('pdfminer').setLevel(logging.WARNING)
 
 # ========== CONFIG ==========
 app = Flask(__name__)
+app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0  # Disable caching
 UPLOAD_FOLDER = "uploads"
 OUTPUT_FOLDER = "converted"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -22,48 +23,57 @@ def clean_numeric_value(value):
     return value
 
 def extract_text(pdf_path):
-    with pdfplumber.open(pdf_path) as pdf:
-        return "\n".join(page.extract_text() for page in pdf.pages if page.extract_text())
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            return "\n".join(page.extract_text() for page in pdf.pages if page.extract_text())
+    except Exception as e:
+        logging.error(f"Error extracting text: {e}")
+        return ""
 
 def extract_table_data(pdf_path):
     rows = []
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            table = page.extract_table()
-            if table and len(table) > 1:
-                for i, row in enumerate(table):
-                    is_probable_header = (
-                        isinstance(row[0], str) and "Code" in row[0] or
-                        isinstance(row[1], str) and "Item" in row[1] or
-                        isinstance(row[2], str) and "Description" in row[2]
-                    )
-                    if is_probable_header:
-                        continue
-                    if len(row) >= 6:
-                        try:
-                            rows.append({
-                                "Code Name": row[0].strip(),
-                                "Item Code": row[1].strip(),
-                                "Description": row[2].strip(),
-                                "Quantity / Unit Type": row[3].split("/")[0].strip(),
-                                "Unit Price (EGP)": clean_numeric_value(row[4]),
-                                "Total Sales Amount (EGP)": clean_numeric_value(row[5])
-                            })
-                        except:
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                table = page.extract_table()
+                if table and len(table) > 1:
+                    for i, row in enumerate(table):
+                        # Skip header rows
+                        if any(col in str(row).lower() for col in ["code", "item", "description"]):
                             continue
+                        if len(row) >= 6:
+                            try:
+                                rows.append({
+                                    "Code Name": row[0].strip() if row[0] else "",
+                                    "Item Code": row[1].strip() if row[1] else "",
+                                    "Description": row[2].strip() if row[2] else "",
+                                    "Quantity / Unit Type": row[3].split("/")[0].strip() if row[3] else "",
+                                    "Unit Price (EGP)": clean_numeric_value(row[4]),
+                                    "Total Sales Amount (EGP)": clean_numeric_value(row[5])
+                                })
+                            except Exception as e:
+                                logging.warning(f"Skipping row due to error: {e}")
+                                continue
+    except Exception as e:
+        logging.error(f"Table extraction failed: {e}")
     return rows
 
 def extract_value(text, keyword):
-    match = re.search(fr"{re.escape(keyword)}[^\S\r\n]*[:—=]?\s*([^\n|]+)", text)
+    if not text:
+        return "N/A"
+    pattern = fr"{re.escape(keyword)}[^\S\r\n]*[:—=]?\s*([^\n|]+)"
+    match = re.search(pattern, text)
     return match.group(1).strip() if match else "N/A"
 
 def extract_numeric_value(text, keyword):
-    pattern = fr"{re.escape(keyword)}\s*\(EGP\)\s*([\d,]+\.?\d*)"
-    match = re.search(pattern, text)
+    if not text:
+        return 0.0
+    pattern = fr"{re.escape(keyword)}\s*\(?EGP\)?\s*[:=]?\s*([\d,]+\.?\d*)"
+    match = re.search(pattern, text, re.IGNORECASE)
     if match:
         try:
             return float(match.group(1).replace(",", ""))
-        except:
+        except ValueError:
             return 0.0
     return 0.0
 
@@ -110,54 +120,84 @@ def extract_invoice_summary(pdf_path):
 def index():
     if request.method == "POST":
         files = request.files.getlist("pdf_files")
+        if not files or all(file.filename == '' for file in files):
+            return render_template("index.html", error="No files selected")
+            
         line_items_list = []
         summary_list = []
 
         for file in files:
-            if file and file.filename.endswith(".pdf"):
-                pdf_path = os.path.join(UPLOAD_FOLDER, file.filename)
-                file.save(pdf_path)
+            if file and file.filename.lower().endswith(".pdf"):
+                try:
+                    pdf_path = os.path.join(UPLOAD_FOLDER, file.filename)
+                    file.save(pdf_path)
+                    
+                    df_line = extract_invoice_line_items(pdf_path)
+                    if not df_line.empty:
+                        df_line["Source File"] = file.filename
+                        line_items_list.append(df_line)
+                    else:
+                        logging.warning(f"No line items extracted from {file.filename}")
 
-                df_line = extract_invoice_line_items(pdf_path)
-                if not df_line.empty:
-                    df_line["Source File"] = file.filename
-                    line_items_list.append(df_line)
+                    df_summary = extract_invoice_summary(pdf_path)
+                    if not df_summary.empty:
+                        df_summary["Source File"] = file.filename
+                        summary_list.append(df_summary)
+                    else:
+                        logging.warning(f"No summary extracted from {file.filename}")
 
-                df_summary = extract_invoice_summary(pdf_path)
-                if not df_summary.empty:
-                    df_summary["Source File"] = file.filename
-                    summary_list.append(df_summary)
+                except Exception as e:
+                    logging.error(f"Error processing {file.filename}: {e}")
+                    continue
 
         if not line_items_list or not summary_list:
-            return "❌ No valid data extracted from the uploaded files."
+            return render_template("index.html", error="Failed to extract data from PDF files")
 
-        df_lines = pd.concat(line_items_list, ignore_index=True)
-        df_summaries = pd.concat(summary_list, ignore_index=True)
+        try:
+            df_lines = pd.concat(line_items_list, ignore_index=True)
+            df_summaries = pd.concat(summary_list, ignore_index=True)
 
-        output_merged = os.path.join(OUTPUT_FOLDER, "invoices_merged.xlsx")
-        extra_columns = df_summaries.columns[12:]
-        columns_to_merge = [col for col in extra_columns if col not in df_lines.columns]
-        df_merged = df_lines.copy()
+            output_merged = os.path.join(OUTPUT_FOLDER, "invoices_merged.xlsx")
+            extra_columns = [col for col in df_summaries.columns if col not in df_lines.columns]
+            
+            df_merged = df_lines.copy()
+            
+            for file_name in df_summaries["Source File"].unique():
+                df_lines_group = df_merged[df_merged["Source File"] == file_name]
+                df_summary_group = df_summaries[df_summaries["Source File"] == file_name]
 
-        for file_name in df_summaries["Source File"].unique():
-            df_lines_group = df_merged[df_merged["Source File"] == file_name]
-            df_summary_group = df_summaries[df_summaries["Source File"] == file_name]
+                if df_lines_group.empty or df_summary_group.empty:
+                    continue
 
-            if df_lines_group.empty or df_summary_group.empty:
-                continue
+                last_index = df_lines_group.index[-1]
+                last_summary_row = df_summary_group.iloc[-1][extra_columns]
 
-            last_index = df_lines_group.index[-1]
-            last_summary_row = df_summary_group.iloc[-1][columns_to_merge]
+                for col in extra_columns:
+                    df_merged.at[last_index, col] = last_summary_row[col]
 
-            for col in columns_to_merge:
-                df_merged.at[last_index, col] = last_summary_row[col]
-
-        df_merged.to_excel(output_merged, index=False)
-        return send_file(output_merged, as_attachment=True)
+            df_merged.to_excel(output_merged, index=False)
+            return send_file(
+                output_merged,
+                as_attachment=True,
+                download_name="invoices_merged.xlsx",
+                mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            )
+        except Exception as e:
+            logging.error(f"Excel generation failed: {e}")
+            return render_template("index.html", error=f"Error generating Excel: {str(e)}")
 
     return render_template("index.html")
 
+@app.after_request
+def add_header(response):
+    # Disable caching for all routes
+    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, post-check=0, pre-check=0, max-age=0'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '-1'
+    return response
+
 # ========== ENTRY POINT ==========
 if __name__ == "__main__":
+    # Start on all network interfaces
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, debug=False)
