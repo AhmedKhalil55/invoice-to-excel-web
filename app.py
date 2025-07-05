@@ -154,5 +154,5 @@ def index():
     return render_template("index.html")
 
 if __name__ == "__main__":
-    app.run(debug=True)
-# main flask app content will be added here
+    # ✅ This line ensures it reads the port from Railway or defaults to 5000 locally
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
