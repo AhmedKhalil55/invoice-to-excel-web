@@ -2,7 +2,7 @@ import os
 import re
 import pdfplumber
 import pandas as pd
-from flask import Flask, render_template, request, send_file, redirect, url_for
+from flask import Flask, render_template, request, send_file
 import logging
 from werkzeug.utils import secure_filename
 
@@ -11,10 +11,13 @@ logging.getLogger("pdfminer").setLevel(logging.WARNING)
 
 # Flask setup
 app = Flask(__name__)
-UPLOAD_FOLDER = "uploads"
-OUTPUT_FOLDER = "converted"
+
+# Use temporary folder to save files on Render
+UPLOAD_FOLDER = "/tmp/uploads"
+OUTPUT_FOLDER = "/tmp/converted"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
 
 # ================== Helper Functions ==================
 
@@ -31,7 +34,12 @@ def clean_numeric_value(value):
 def extract_text(pdf_path):
     """Extract raw text from all PDF pages."""
     with pdfplumber.open(pdf_path) as pdf:
-        return "\n".join(page.extract_text() for page in pdf.pages if page.extract_text())
+        texts = []
+        for page in pdf.pages:
+            t = page.extract_text()
+            if t:
+                texts.append(t)
+        return "\n".join(texts)
 
 
 def extract_table_data(pdf_path):
@@ -40,28 +48,30 @@ def extract_table_data(pdf_path):
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
             table = page.extract_table()
-            if table and len(table) > 1:
-                for row in table:
-                    # Skip header-like rows
-                    if any(
-                        isinstance(cell, str)
-                        and any(word in cell for word in ["Code", "Item", "Description"])
-                        for cell in row
-                    ):
-                        continue
+            if not table or len(table) <= 1:
+                continue
 
-                    if len(row) >= 6:
-                        try:
-                            rows.append({
-                                "Code Name": (row[0] or "").strip(),
-                                "Item Code": (row[1] or "").strip(),
-                                "Description": (row[2] or "").strip(),
-                                "Quantity / Unit Type": (row[3] or "").split("/")[0].strip(),
-                                "Unit Price (EGP)": clean_numeric_value(row[4]),
-                                "Total Sales Amount (EGP)": clean_numeric_value(row[5])
-                            })
-                        except Exception:
-                            continue
+            for row in table:
+                # Skip header-like rows
+                if any(
+                    isinstance(cell, str)
+                    and any(word in cell for word in ["Code", "Item", "Description"])
+                    for cell in row
+                ):
+                    continue
+
+                if len(row) >= 6:
+                    try:
+                        rows.append({
+                            "Code Name": (row[0] or "").strip(),
+                            "Item Code": (row[1] or "").strip(),
+                            "Description": (row[2] or "").strip(),
+                            "Quantity / Unit Type": (row[3] or "").split("/")[0].strip(),
+                            "Unit Price (EGP)": clean_numeric_value(row[4]),
+                            "Total Sales Amount (EGP)": clean_numeric_value(row[5]),
+                        })
+                    except Exception:
+                        continue
     return rows
 
 
@@ -119,7 +129,7 @@ def extract_invoice_summary(pdf_path):
         "Total Item discount": extract_numeric_value(text, "Total Items Discount"),
         "Value added tax": extract_numeric_value(text, "Value added tax"),
         "Extra invoice discount": extract_numeric_value(text, "Extra Invoice Discounts"),
-        "Total amount": extract_numeric_value(text, "Total Amount")
+        "Total amount": extract_numeric_value(text, "Total Amount"),
     }
     return pd.DataFrame([summary])
 
@@ -130,15 +140,17 @@ def extract_invoice_summary(pdf_path):
 def index():
     if request.method == "POST":
         files = request.files.getlist("pdf_files")
-        line_items_list = []
-        summary_list = []
+        line_items_list, summary_list = [], []
 
         for file in files:
-            if file and file.filename.endswith(".pdf"):
-                safe_filename = secure_filename(file.filename)
-                pdf_path = os.path.join(UPLOAD_FOLDER, safe_filename)
-                file.save(pdf_path)
+            if not (file and file.filename.endswith(".pdf")):
+                continue
 
+            safe_filename = secure_filename(file.filename)
+            pdf_path = os.path.join(UPLOAD_FOLDER, safe_filename)
+            file.save(pdf_path)
+
+            try:
                 df_line = extract_invoice_line_items(pdf_path)
                 if not df_line.empty:
                     df_line["Source File"] = safe_filename
@@ -148,6 +160,10 @@ def index():
                 if not df_summary.empty:
                     df_summary["Source File"] = safe_filename
                     summary_list.append(df_summary)
+            finally:
+                # Clean up temporary file
+                if os.path.exists(pdf_path):
+                    os.remove(pdf_path)
 
         if not line_items_list or not summary_list:
             return "❌ No valid data extracted from the uploaded files."
@@ -181,5 +197,4 @@ def index():
 
 # ================== Main Entry ==================
 if __name__ == "__main__":
-    # For local testing only
-    app.run(host="0.0.0.0", port=10000, debug=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
