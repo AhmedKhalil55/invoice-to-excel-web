@@ -4,85 +4,58 @@ import pdfplumber
 import pandas as pd
 from flask import Flask, render_template, request, send_file
 import logging
-from werkzeug.utils import secure_filename
 
-# Suppress unnecessary pdfminer logs
-logging.getLogger("pdfminer").setLevel(logging.WARNING)
+# Suppress unnecessary logging
+logging.getLogger('pdfminer').setLevel(logging.WARNING)
 
-# Flask setup
 app = Flask(__name__)
-
-# Use temporary folder to save files on Render
-UPLOAD_FOLDER = "/tmp/uploads"
-OUTPUT_FOLDER = "/tmp/converted"
+UPLOAD_FOLDER = "uploads"
+OUTPUT_FOLDER = "converted"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-
-# ================== Helper Functions ==================
-
 def clean_numeric_value(value):
-    """Remove non-numeric characters and convert to float."""
     if isinstance(value, str):
-        try:
-            return float(re.sub(r"[^\d.]", "", value.replace(",", "")))
-        except:
-            return 0.0
+        return float(re.sub(r"[^\d.]", "", value.replace(",", "")))
     return value
 
-
 def extract_text(pdf_path):
-    """Extract raw text from all PDF pages."""
     with pdfplumber.open(pdf_path) as pdf:
-        texts = []
-        for page in pdf.pages:
-            t = page.extract_text()
-            if t:
-                texts.append(t)
-        return "\n".join(texts)
-
+        return "\n".join(page.extract_text() for page in pdf.pages if page.extract_text())
 
 def extract_table_data(pdf_path):
-    """Extract tabular data from PDF pages."""
     rows = []
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
             table = page.extract_table()
-            if not table or len(table) <= 1:
-                continue
-
-            for row in table:
-                # Skip header-like rows
-                if any(
-                    isinstance(cell, str)
-                    and any(word in cell for word in ["Code", "Item", "Description"])
-                    for cell in row
-                ):
-                    continue
-
-                if len(row) >= 6:
-                    try:
-                        rows.append({
-                            "Code Name": (row[0] or "").strip(),
-                            "Item Code": (row[1] or "").strip(),
-                            "Description": (row[2] or "").strip(),
-                            "Quantity / Unit Type": (row[3] or "").split("/")[0].strip(),
-                            "Unit Price (EGP)": clean_numeric_value(row[4]),
-                            "Total Sales Amount (EGP)": clean_numeric_value(row[5]),
-                        })
-                    except Exception:
+            if table and len(table) > 1:
+                for i, row in enumerate(table):
+                    is_probable_header = (
+                        isinstance(row[0], str) and "Code" in row[0] or
+                        isinstance(row[1], str) and "Item" in row[1] or
+                        isinstance(row[2], str) and "Description" in row[2]
+                    )
+                    if is_probable_header:
                         continue
+                    if len(row) >= 6:
+                        try:
+                            rows.append({
+                                "Code Name": row[0].strip(),
+                                "Item Code": row[1].strip(),
+                                "Description": row[2].strip(),
+                                "Quantity / Unit Type": row[3].split("/")[0].strip(),
+                                "Unit Price (EGP)": clean_numeric_value(row[4]),
+                                "Total Sales Amount (EGP)": clean_numeric_value(row[5])
+                            })
+                        except:
+                            continue
     return rows
 
-
 def extract_value(text, keyword):
-    """Extract plain text values after specific keywords."""
     match = re.search(fr"{re.escape(keyword)}[^\S\r\n]*[:—=]?\s*([^\n|]+)", text)
     return match.group(1).strip() if match else "N/A"
 
-
 def extract_numeric_value(text, keyword):
-    """Extract numeric values from text."""
     pattern = fr"{re.escape(keyword)}\s*\(EGP\)\s*([\d,]+\.?\d*)"
     match = re.search(pattern, text)
     if match:
@@ -91,9 +64,6 @@ def extract_numeric_value(text, keyword):
         except:
             return 0.0
     return 0.0
-
-
-# ================== Extraction Functions ==================
 
 def extract_invoice_line_items(pdf_path):
     text = extract_text(pdf_path)
@@ -107,7 +77,6 @@ def extract_invoice_line_items(pdf_path):
     }
     line_items = extract_table_data(pdf_path)
     return pd.DataFrame([{**base_data, **item} for item in line_items])
-
 
 def extract_invoice_summary(pdf_path):
     text = extract_text(pdf_path).replace("|", "").replace("—", ":").replace("–", ":")
@@ -129,41 +98,31 @@ def extract_invoice_summary(pdf_path):
         "Total Item discount": extract_numeric_value(text, "Total Items Discount"),
         "Value added tax": extract_numeric_value(text, "Value added tax"),
         "Extra invoice discount": extract_numeric_value(text, "Extra Invoice Discounts"),
-        "Total amount": extract_numeric_value(text, "Total Amount"),
+        "Total amount": extract_numeric_value(text, "Total Amount")
     }
     return pd.DataFrame([summary])
-
-
-# ================== Routes ==================
 
 @app.route("/", methods=["GET", "POST"])
 def index():
     if request.method == "POST":
         files = request.files.getlist("pdf_files")
-        line_items_list, summary_list = [], []
+        line_items_list = []
+        summary_list = []
 
         for file in files:
-            if not (file and file.filename.endswith(".pdf")):
-                continue
+            if file and file.filename.endswith(".pdf"):
+                pdf_path = os.path.join(UPLOAD_FOLDER, file.filename)
+                file.save(pdf_path)
 
-            safe_filename = secure_filename(file.filename)
-            pdf_path = os.path.join(UPLOAD_FOLDER, safe_filename)
-            file.save(pdf_path)
-
-            try:
                 df_line = extract_invoice_line_items(pdf_path)
                 if not df_line.empty:
-                    df_line["Source File"] = safe_filename
+                    df_line["Source File"] = file.filename
                     line_items_list.append(df_line)
 
                 df_summary = extract_invoice_summary(pdf_path)
                 if not df_summary.empty:
-                    df_summary["Source File"] = safe_filename
+                    df_summary["Source File"] = file.filename
                     summary_list.append(df_summary)
-            finally:
-                # Clean up temporary file
-                if os.path.exists(pdf_path):
-                    os.remove(pdf_path)
 
         if not line_items_list or not summary_list:
             return "❌ No valid data extracted from the uploaded files."
@@ -194,7 +153,5 @@ def index():
 
     return render_template("index.html")
 
-
-# ================== Main Entry ==================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    app.run(host="0.0.0.0", port=81)
